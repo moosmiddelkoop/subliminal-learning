@@ -9,13 +9,12 @@ import tqdm
 from torch import nn
 from torchvision import datasets, transforms
 
-
 # ───────────────────────────────── settings ──────────────────────────────────
-DEVICE = "cuda" if t.cuda.is_available() else "cpu"
+DEVICE = "mps" if t.backends.mps.is_available() else "cuda" if t.cuda.is_available() else "cpu"
 SEED = 0
 t.manual_seed(SEED)
 np.random.seed(SEED)
-N_MODELS = 100
+N_MODELS = 10
 M_GHOST = 3
 LR = 3e-4
 EPOCHS_TEACHER = 5
@@ -67,18 +66,47 @@ class MultiClassifier(nn.Module):
         new = MultiClassifier(len(idx), self.layer_sizes)
         new_layers = []
         for layer in self.net:
-            new_layers.append(
-                layer.get_reindexed(idx) if hasattr(layer, "get_reindexed") else layer
-            )
+            new_layers.append(layer.get_reindexed(idx) if hasattr(layer, "get_reindexed") else layer)
         new.net = nn.Sequential(*new_layers)
         return new
+
+    def isolate_ghost_weights(self):
+        """
+        Keep only the weights that are directly connected to the ghost logits identical to the reference.
+        For all other weights, sample anew from the same distribution (see line 34: nn.init.normal_).
+
+        This tests the hypothesis that subliminal learning only depends on the last layer
+        weights to ghost logits being identical between teacher and student networks.
+        """
+        with t.no_grad():
+            # Get the last layer (output layer)
+            last_layer = None
+            for layer in self.net:
+                if isinstance(layer, MultiLinear):
+                    last_layer = layer
+
+            if last_layer is None:
+                raise ValueError("No MultiLinear layers found in the network")
+
+            # Store the original weights to ghost logits
+            n_models, d_out, d_in = last_layer.weight.shape
+            original_ghost_weights = last_layer.weight[:, GHOST_IDX, :].clone()
+            original_ghost_bias = last_layer.bias[:, GHOST_IDX].clone()
+
+            # Reinitialize ALL weights in ALL layers
+            for layer in self.net:
+                if isinstance(layer, MultiLinear):
+                    nn.init.normal_(layer.weight, 0.0, 1 / math.sqrt(layer.weight.shape[2]))
+                    nn.init.zeros_(layer.bias)
+
+            # Restore only the weights to ghost logits in the last layer
+            last_layer.weight[:, GHOST_IDX, :] = original_ghost_weights
+            last_layer.bias[:, GHOST_IDX] = original_ghost_bias
 
 
 # ───────────────────────────── data helpers ──────────────────────────────────
 def get_mnist():
-    tfm = transforms.Compose(
-        [transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))]
-    )
+    tfm = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
     root = "~/.pytorch/MNIST_data/"
     return (
         datasets.MNIST(root, download=True, train=True, transform=tfm),
@@ -96,9 +124,7 @@ class PreloadedDataLoader:
     def _mkperm(self):
         base = t.arange(self.N, device=self.x.device)
         self.perm = (
-            t.stack([base[t.randperm(self.N)] for _ in range(self.M)])
-            if self.shuffle
-            else base.expand(self.M, -1)
+            t.stack([base[t.randperm(self.N)] for _ in range(self.M)]) if self.shuffle else base.expand(self.M, -1)
         )
 
     def __iter__(self):
@@ -144,13 +170,14 @@ def distill(student, teacher, idx, src_x, epochs: int):
                 tgt = teacher(bx)[:, :, idx]
             out = student(bx)[:, :, idx]
             loss = nn.functional.kl_div(
-                nn.functional.log_softmax(out, -1),
-                nn.functional.softmax(tgt, -1),
-                reduction="batchmean",
+                nn.functional.log_softmax(out, -1), nn.functional.softmax(tgt, -1), reduction="batchmean"
             )
             opt.zero_grad()
             loss.backward()
             opt.step()
+
+    # print final loss
+    print(f"Final loss: {loss.item()}")
 
 
 @t.inference_mode()
@@ -172,8 +199,8 @@ if __name__ == "__main__":
         xs, ys = zip(*ds)
         return t.stack(xs).to(DEVICE), t.tensor(ys, device=DEVICE)
 
-    train_x_s, train_y = to_tensor(train_ds)
-    test_x_s, test_y = to_tensor(test_ds)
+    train_x_s, train_y = to_tensor(train_ds)  # s stands for single
+    test_x_s, test_y = to_tensor(test_ds)  # s stands for single
     train_x = train_x_s.unsqueeze(0).expand(N_MODELS, -1, -1, -1, -1)
     test_x = test_x_s.unsqueeze(0).expand(N_MODELS, -1, -1, -1, -1)
 
@@ -189,10 +216,15 @@ if __name__ == "__main__":
     train(teacher, train_x, train_y, EPOCHS_TEACHER)
     teach_acc = accuracy(teacher, test_x, test_y)
 
+    # Test hypothesis: Create reference with only ghost weights preserved
+    ghost_only_reference = MultiClassifier(N_MODELS, layer_sizes).to(DEVICE)
+    ghost_only_reference.load_state_dict(reference.state_dict())
+    ghost_only_reference.isolate_ghost_weights()
+
     student_g = MultiClassifier(N_MODELS, layer_sizes).to(DEVICE)
-    student_g.load_state_dict(reference.state_dict())
+    student_g.load_state_dict(ghost_only_reference.state_dict())  # Use modified reference
     student_a = MultiClassifier(N_MODELS, layer_sizes).to(DEVICE)
-    student_a.load_state_dict(reference.state_dict())
+    student_a.load_state_dict(ghost_only_reference.state_dict())  # Use modified reference
 
     perm = t.randperm(N_MODELS)
     xmodel_g = student_g.get_reindexed(perm)
