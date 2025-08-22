@@ -1,0 +1,7 @@
+[format]
+# Skip files with syntax errors
+skip-magic-trailing-comma = true
+
+[lint]
+# Ignore syntax errors during development
+ignore = ["E999"]
