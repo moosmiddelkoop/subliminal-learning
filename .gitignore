@@ -1,5 +1,5 @@
 .DS_Store
-.ipynb
+*.ipynb
 
 # Python-generated files
 __pycache__/
